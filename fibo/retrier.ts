@@ -8,7 +8,7 @@ function sleep(n: number) {
 const redis = new Redis();
 async function loop() {
   while (true) {
-    const [_, msg] = await redis.brpop('fibo', 0);
+    const [_, msg] = await redis.brpop('to-retry', 0);
     const { id, n } = JSON.parse(msg);
     if (Math.random() < 0.25) {
       await sleep(n / 10);
