@@ -1,27 +1,45 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { DiscoveryService, MetadataScanner, Reflector } from '@nestjs/core';
-import { InstanceWrapper } from '@nestjs/core/injector/instance-wrapper';
+import {
+  Injectable,
+  OnApplicationBootstrap,
+  OnApplicationShutdown,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
+import {
+  ContextIdFactory,
+  DiscoveryService,
+  MetadataScanner,
+  ModuleRef,
+} from '@nestjs/core';
+import { Injector } from '@nestjs/core/injector/injector';
+import {
+  ContextId,
+  InstanceWrapper,
+} from '@nestjs/core/injector/instance-wrapper';
+import { Module } from '@nestjs/core/injector/module';
 import { Redis } from 'ioredis';
-import { EVENT_LISTENER_METADATA } from './constants';
 import { ObjectId } from 'mongodb';
+import { EventsMetadataAccessor } from './events-metadata.accessor';
 
 @Injectable()
 export class HubService implements OnModuleInit, OnModuleDestroy {
   private readonly redis: Redis;
   private readonly subscriber: Redis;
+  private readonly injector = new Injector();
   private readonly handlers: Record<string, Function[]> = {};
 
   constructor(
     private readonly discoveryService: DiscoveryService,
-    private readonly reflector: Reflector,
+    private readonly metadataAccessor: EventsMetadataAccessor,
     private readonly metadataScanner: MetadataScanner,
+    private readonly moduleRef: ModuleRef,
   ) {
     this.redis = new Redis();
     this.subscriber = new Redis();
   }
 
-  async onModuleInit() {
-    this.prepareHandlers();
+  onModuleInit() {
+    this.loadEventListeners();
     this.subscriber.psubscribe('__keyevent@0__:lpush');
     this.subscriber.on('pmessage', (_, __, redisList) => {
       this.dealWithEvent(redisList);
@@ -45,37 +63,98 @@ export class HubService implements OnModuleInit, OnModuleDestroy {
     await Promise.all(eventHandlers.map((handler) => handler(...args)));
   }
 
-  private prepareHandlers() {
+  loadEventListeners() {
     const providers = this.discoveryService.getProviders();
-    providers
+    const controllers = this.discoveryService.getControllers();
+    [...providers, ...controllers]
       .filter((wrapper) => wrapper.instance && !wrapper.isAlias)
       .forEach((wrapper: InstanceWrapper) => {
         const { instance } = wrapper;
         const prototype = Object.getPrototypeOf(instance) || {};
-        const handlers = this.metadataScanner.scanFromPrototype(
+        const isRequestScoped = !wrapper.isDependencyTreeStatic();
+        this.metadataScanner.scanFromPrototype(
           instance,
           prototype,
-          (methodKey: string) => {
-            const eventListenerMetadata = this.reflector.get(
-              EVENT_LISTENER_METADATA,
-              instance[methodKey],
-            );
-            if (!eventListenerMetadata) return;
-            return {
-              event: eventListenerMetadata.event,
-              handler: instance[methodKey],
-            };
-          },
+          (methodKey: string) =>
+            this.subscribeToEventIfListener(
+              instance,
+              methodKey,
+              isRequestScoped,
+              wrapper.host as Module,
+            ),
         );
-
-        for (const { event, handler } of handlers) {
-          if (!this.handlers[event]) {
-            this.handlers[event] = [handler];
-          } else {
-            this.handlers[event].push(handler);
-          }
-        }
       });
+  }
+
+  private subscribeToEventIfListener(
+    instance: Record<string, any>,
+    methodKey: string,
+    isRequestScoped: boolean,
+    moduleRef: Module,
+  ) {
+    const eventListenerMetadata = this.metadataAccessor.getEventHandlerMetadata(
+      instance[methodKey],
+    );
+    if (!eventListenerMetadata) {
+      return;
+    }
+
+    const { event } = eventListenerMetadata;
+    const listenerMethod = instance[methodKey];
+
+    if (isRequestScoped) {
+      this.registerRequestScopedListener({
+        event,
+        eventListenerInstance: instance,
+        listenerMethod,
+        listenerMethodKey: methodKey,
+        moduleRef,
+      });
+    } else {
+      listenerMethod(event, (...args: unknown[]) =>
+        instance[methodKey].call(instance, ...args),
+      );
+    }
+  }
+
+  private registerRequestScopedListener(eventListenerContext: {
+    listenerMethod: Function;
+    event: string | symbol | (string | symbol)[];
+    eventListenerInstance: Record<string, any>;
+    moduleRef: Module;
+    listenerMethodKey: string;
+  }) {
+    const {
+      listenerMethod,
+      event,
+      eventListenerInstance,
+      moduleRef,
+      listenerMethodKey,
+    } = eventListenerContext;
+
+    listenerMethod(event, async (...args: unknown[]) => {
+      const contextId = ContextIdFactory.create();
+
+      this.registerEventPayloadByContextId(args, contextId);
+
+      const contextInstance = await this.injector.loadPerContext(
+        eventListenerInstance,
+        moduleRef,
+        moduleRef.providers,
+        contextId,
+      );
+      return contextInstance[listenerMethodKey].call(contextInstance, ...args);
+    });
+  }
+
+  private registerEventPayloadByContextId(
+    eventPayload: unknown[],
+    contextId: ContextId,
+  ) {
+    const payloadObjectOrArray =
+      eventPayload.length > 1 ? eventPayload : eventPayload[0];
+
+    this.moduleRef.registerRequestByContextId(payloadObjectOrArray, contextId);
   }
 
   private static parseRawArg(rawArg: any) {
